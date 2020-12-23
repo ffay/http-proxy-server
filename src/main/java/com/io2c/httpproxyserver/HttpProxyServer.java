@@ -2,6 +2,8 @@ package com.io2c.httpproxyserver;
 
 import com.io2c.httpproxyserver.container.Container;
 import com.io2c.httpproxyserver.container.ContainerHelper;
+import com.io2c.httpproxyserver.handler.HttpProxyRequestHandler;
+import com.io2c.httpproxyserver.handler.HttpsCommandHandler;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -12,10 +14,13 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.*;
+import io.netty.handler.ssl.SslHandler;
 import io.netty.util.AttributeKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -31,15 +36,15 @@ public class HttpProxyServer implements Container {
 
     private static final Logger LOG = LoggerFactory.getLogger(HttpProxyServer.class);
 
-    private static final String TRUE = "true";
+    public static final String TRUE = "true";
 
-    private static final String CONFIG_SERVER_PORT_KEY = "server.port";
+    public static final String CONFIG_SERVER_PORT_KEY = "server.port";
 
-    private static AttributeKey<Channel> nextChannelAttributeKey = AttributeKey.newInstance("nextChannelAttributeKey");
+    public static AttributeKey<Channel> nextChannelAttributeKey = AttributeKey.newInstance("nextChannelAttributeKey");
 
-    private static AttributeKey<HttpMethod> httpMethodAttributeKey = AttributeKey.newInstance("httpMethodAttributeKey");
+    public static AttributeKey<HttpMethod> httpMethodAttributeKey = AttributeKey.newInstance("httpMethodAttributeKey");
 
-    private static AttributeKey<String> httpUriAttributeKey = AttributeKey.newInstance("httpUriAttributeKey");
+    public static AttributeKey<String> httpUriAttributeKey = AttributeKey.newInstance("httpUriAttributeKey");
 
     private NioEventLoopGroup bossGroup = new NioEventLoopGroup(1);
 
@@ -64,12 +69,16 @@ public class HttpProxyServer implements Container {
     @Override
     public void start() {
         ServerBootstrap httpServerBootstrap = new ServerBootstrap();
+        ServerBootstrap httpsServerBootstrap = new ServerBootstrap();
         Bootstrap proxyClientBootstrap = new Bootstrap();
         initProxyClient(proxyClientBootstrap, workerGroup);
-        initProxyServer(httpServerBootstrap, proxyClientBootstrap, bossGroup, workerGroup);
+        initHttpProxyServer(httpServerBootstrap, proxyClientBootstrap, bossGroup, workerGroup);
+        initHttpsProxyServer(httpsServerBootstrap, proxyClientBootstrap, bossGroup, workerGroup);
         try {
             httpServerBootstrap.bind(configuration.getProperty("server.bind"), Integer.parseInt(configuration.getProperty(CONFIG_SERVER_PORT_KEY))).get();
-            LOG.info("server started on port {}, bind {}", configuration.getProperty(CONFIG_SERVER_PORT_KEY), configuration.getProperty("server.bind"));
+            LOG.info("http proxy server started on port {}, bind {}", configuration.getProperty(CONFIG_SERVER_PORT_KEY), configuration.getProperty("server.bind"));
+            httpsServerBootstrap.bind(configuration.getProperty("server.https.bind"), Integer.parseInt(configuration.getProperty("server.https.port"))).get();
+            LOG.info("https proxy server started on port {}, bind {}", configuration.getProperty("server.https.port"), configuration.getProperty("server.https.bind"));
         } catch (Exception ex) {
             throw new RuntimeException(ex);
         }
@@ -124,17 +133,10 @@ public class HttpProxyServer implements Container {
         });
     }
 
-
-    /**
-     * 初始化代理服务器
-     *
-     * @param httpServerBootstrap
-     * @param proxyClientBootstrap
-     * @param bossGroup
-     * @param workerGroup
-     */
-    private void initProxyServer(ServerBootstrap httpServerBootstrap, final Bootstrap proxyClientBootstrap, NioEventLoopGroup bossGroup, NioEventLoopGroup workerGroup) {
-        httpServerBootstrap.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<SocketChannel>() {
+    private void initHttpsProxyServer(ServerBootstrap httpsServerBootstrap, final Bootstrap proxyClientBootstrap, NioEventLoopGroup bossGroup, NioEventLoopGroup workerGroup) {
+        final SSLContext sslContext = new SslContextCreator().initSSLContext(configuration.getProperty("server.https.jksPath"),
+                configuration.getProperty("server.https.keyStorePassword"), configuration.getProperty("server.https.keyManagerPassword"));
+        httpsServerBootstrap.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<SocketChannel>() {
 
             @Override
             public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
@@ -145,142 +147,41 @@ public class HttpProxyServer implements Container {
             @Override
             public void initChannel(SocketChannel ch) throws Exception {
                 ChannelPipeline pipeline = ch.pipeline();
-                pipeline.addLast(new ChannelInboundHandlerAdapter() {
+                pipeline.addLast("ssl", createSslHandler(sslContext));
+                pipeline.addLast(new HttpsCommandHandler(proxyClientBootstrap));
+                pipeline.addLast("httpServerCodec", new HttpServerCodec()).addLast("httpRequestHandler", new HttpProxyRequestHandler(proxyClientBootstrap, configuration));
+            }
+        });
+    }
 
-                    private volatile Channel targetChannel;
+    private ChannelHandler createSslHandler(SSLContext sslContext) {
+        SSLEngine sslEngine = sslContext.createSSLEngine();
+        sslEngine.setUseClientMode(false);
+        return new SslHandler(sslEngine);
+    }
 
-                    @Override
-                    public void channelRead(final ChannelHandlerContext ctx, Object msg) throws Exception {
-                        if (targetChannel == null) {
-                            super.channelRead(ctx, msg);
-                            // HTTPS代理
-                            if (ctx.channel().attr(httpMethodAttributeKey).get() == HttpMethod.CONNECT) {
-                                URI uri = new URI("https://" + ctx.channel().attr(httpUriAttributeKey).get());
-                                proxyClientBootstrap.connect(uri.getHost(), uri.getPort()).addListener(new ChannelFutureListener() {
+    /**
+     * 初始化代理服务器
+     *
+     * @param httpServerBootstrap
+     * @param proxyClientBootstrap
+     * @param bossGroup
+     * @param workerGroup
+     */
+    private void initHttpProxyServer(ServerBootstrap httpServerBootstrap, final Bootstrap proxyClientBootstrap, NioEventLoopGroup bossGroup, NioEventLoopGroup workerGroup) {
+        httpServerBootstrap.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<SocketChannel>() {
 
-                                    @Override
-                                    public void operationComplete(final ChannelFuture future) throws Exception {
+            @Override
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                LOG.error("exceptionCaught", cause);
+                super.exceptionCaught(ctx, cause);
+            }
 
-                                        // 连接后端服务器成功
-                                        if (future.isSuccess()) {
-                                            targetChannel = future.channel();
-                                            targetChannel.attr(nextChannelAttributeKey).set(ctx.channel());
-                                            ctx.channel().attr(nextChannelAttributeKey).set(targetChannel);
-                                            future.channel().pipeline().remove("httpClientCodec");
-                                            FullHttpResponse resp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, new HttpResponseStatus(200, "Connection Established"));
-                                            ctx.channel().writeAndFlush(resp).addListener(new ChannelFutureListener() {
-
-                                                @Override
-                                                public void operationComplete(ChannelFuture channelFuture) throws Exception {
-                                                    ctx.pipeline().remove("httpServerCodec");
-                                                    ctx.pipeline().remove("httpRequestHandler");
-                                                }
-                                            });
-                                        } else {
-                                            ctx.channel().close();
-                                        }
-                                    }
-                                });
-                            }
-                        } else {
-                            targetChannel.writeAndFlush(msg);
-                        }
-                    }
-
-                    @Override
-                    public void channelWritabilityChanged(ChannelHandlerContext ctx) throws Exception {
-                        Channel targetChannel = ctx.channel().attr(nextChannelAttributeKey).get();
-                        if (targetChannel != null) {
-                            targetChannel.config().setOption(ChannelOption.AUTO_READ, ctx.channel().isWritable());
-                        }
-                        super.channelWritabilityChanged(ctx);
-                    }
-
-                    @Override
-                    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-                        Channel targetChannel = ctx.channel().attr(nextChannelAttributeKey).get();
-                        if (targetChannel != null) {
-                            targetChannel.close();
-                        }
-                        super.channelInactive(ctx);
-                    }
-                });
-                pipeline.addLast("httpServerCodec", new HttpServerCodec()).addLast("httpRequestHandler", new ChannelInboundHandlerAdapter() {
-
-                    private volatile Channel targetChannel;
-
-                    private Queue<Object> receivedLastMsgsWhenConnect = new LinkedList<>();
-
-                    @Override
-                    public void channelRead(final ChannelHandlerContext ctx, final Object msg) throws Exception {
-                        if (msg instanceof HttpRequest) {
-                            DefaultHttpRequest request = (DefaultHttpRequest) msg;
-                            //Basic认证
-                            String enableBasic = configuration.getProperty("auth.enableBasic");
-                            if (enableBasic != null && TRUE.equals(enableBasic)) {
-                                if (!basicLogin(request)) {
-                                    FullHttpResponse resp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.PROXY_AUTHENTICATION_REQUIRED);
-                                    resp.headers().add("Proxy-Authenticate", "Basic realm=\"Text\"");
-                                    resp.headers().set("Content-Length", resp.content().readableBytes());
-                                    ctx.channel().writeAndFlush(resp);
-                                    return;
-                                }
-                            }
-                            ctx.channel().attr(httpUriAttributeKey).set(request.getUri());
-                            ctx.channel().attr(httpMethodAttributeKey).set(request.getMethod());
-                            if (((HttpRequest) msg).getMethod() != HttpMethod.CONNECT) {
-                                if (targetChannel == null) {
-                                    URI uri = new URI(ctx.channel().attr(httpUriAttributeKey).get());
-                                    ctx.channel().config().setOption(ChannelOption.AUTO_READ, false);
-                                    //禁止访问的端口和代理端口一样，避免死循环
-                                    if (uri.getPort() == Integer.parseInt(configuration.getProperty(CONFIG_SERVER_PORT_KEY))) {
-                                        FullHttpResponse resp = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.FORBIDDEN);
-                                        resp.headers().set("Content-Length", resp.content().readableBytes());
-                                        ctx.channel().writeAndFlush(resp).addListener(ChannelFutureListener.CLOSE);
-                                        return;
-                                    }
-                                    proxyClientBootstrap.connect(uri.getHost(), uri.getPort() == -1 ? 80 : uri.getPort()).addListener(new ChannelFutureListener() {
-
-                                        @Override
-                                        public void operationComplete(ChannelFuture future) throws Exception {
-                                            // 连接后端服务器成功
-                                            if (future.isSuccess()) {
-                                                future.channel().writeAndFlush(msg);
-                                                Object msg0;
-                                                synchronized (receivedLastMsgsWhenConnect) {
-                                                    while ((msg0 = receivedLastMsgsWhenConnect.poll()) != null) {
-                                                        future.channel().writeAndFlush(msg0);
-                                                    }
-                                                    targetChannel = future.channel();
-                                                    targetChannel.attr(nextChannelAttributeKey).set(ctx.channel());
-                                                    ctx.channel().attr(nextChannelAttributeKey).set(targetChannel);
-                                                }
-                                                ctx.channel().config().setOption(ChannelOption.AUTO_READ, true);
-                                            } else {
-                                                ctx.channel().close();
-                                            }
-                                        }
-
-                                    });
-                                } else {
-                                    targetChannel.writeAndFlush(msg);
-                                }
-                            }
-                        } else {
-                            if (targetChannel == null) {
-                                synchronized (receivedLastMsgsWhenConnect) {
-                                    if (targetChannel == null) {
-                                        receivedLastMsgsWhenConnect.offer(msg);
-                                    } else {
-                                        targetChannel.writeAndFlush(msg);
-                                    }
-                                }
-                            } else {
-                                targetChannel.writeAndFlush(msg);
-                            }
-                        }
-                    }
-                });
+            @Override
+            public void initChannel(SocketChannel ch) {
+                ChannelPipeline pipeline = ch.pipeline();
+                pipeline.addLast(new HttpsCommandHandler(proxyClientBootstrap));
+                pipeline.addLast("httpServerCodec", new HttpServerCodec()).addLast("httpRequestHandler", new HttpProxyRequestHandler(proxyClientBootstrap, configuration));
             }
         });
     }
@@ -314,5 +215,4 @@ public class HttpProxyServer implements Container {
         }
         return true;
     }
-
 }
