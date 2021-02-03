@@ -82,6 +82,7 @@
                                     <directory>src/main/resources</directory>
                                     <includes>
                                         <include>*.properties</include>
+                                        <include>*.jks</include>
                                     </includes>
                                 </resource>
                             </resources>
