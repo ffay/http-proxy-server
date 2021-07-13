@@ -4,6 +4,8 @@ import com.io2c.httpproxyserver.container.Container;
 import com.io2c.httpproxyserver.container.ContainerHelper;
 import com.io2c.httpproxyserver.handler.HttpProxyRequestHandler;
 import com.io2c.httpproxyserver.handler.HttpsCommandHandler;
+import com.io2c.httpproxyserver.handler.socks.HttpsSocksProxyChannelHandler;
+import com.io2c.httpproxyserver.handler.socks.RealServerChannelHandler;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -13,7 +15,10 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.http.*;
+import io.netty.handler.codec.http.HttpClientCodec;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.AttributeKey;
 import org.slf4j.Logger;
@@ -23,11 +28,11 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URI;
+import java.net.InetSocketAddress;
 import java.util.Arrays;
-import java.util.LinkedList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
-import java.util.Queue;
 
 /**
  * @author fei.feng
@@ -45,6 +50,8 @@ public class HttpProxyServer implements Container {
     public static AttributeKey<HttpMethod> httpMethodAttributeKey = AttributeKey.newInstance("httpMethodAttributeKey");
 
     public static AttributeKey<String> httpUriAttributeKey = AttributeKey.newInstance("httpUriAttributeKey");
+
+    public static AttributeKey<String> connectInfoAttributeKey = AttributeKey.newInstance("connectInfoAttributeKey");
 
     private NioEventLoopGroup bossGroup = new NioEventLoopGroup(1);
 
@@ -74,6 +81,7 @@ public class HttpProxyServer implements Container {
         initProxyClient(proxyClientBootstrap, workerGroup);
         initHttpProxyServer(httpServerBootstrap, proxyClientBootstrap, bossGroup, workerGroup);
         initHttpsProxyServer(httpsServerBootstrap, proxyClientBootstrap, bossGroup, workerGroup);
+        initHttpsSocksProxyServer();
         try {
             httpServerBootstrap.bind(configuration.getProperty("server.bind"), Integer.parseInt(configuration.getProperty(CONFIG_SERVER_PORT_KEY))).get();
             LOG.info("http proxy server started on port {}, bind {}", configuration.getProperty(CONFIG_SERVER_PORT_KEY), configuration.getProperty("server.bind"));
@@ -152,6 +160,65 @@ public class HttpProxyServer implements Container {
                 pipeline.addLast("httpServerCodec", new HttpServerCodec()).addLast("httpRequestHandler", new HttpProxyRequestHandler(proxyClientBootstrap, configuration));
             }
         });
+    }
+
+    private void initHttpsSocksProxyServer() {
+        ServerBootstrap serverBootstrap = new ServerBootstrap();
+        final Bootstrap proxyClientBootstrap = new Bootstrap();
+        proxyClientBootstrap.channel(NioSocketChannel.class);
+        proxyClientBootstrap.group(workerGroup).handler(new ChannelInitializer<SocketChannel>() {
+
+            @Override
+            public void initChannel(SocketChannel ch) {
+                ch.pipeline().addLast(new RealServerChannelHandler());
+            }
+        });
+
+        String configStr = configuration.getProperty("server.https.proxy.config");//port->ip:port,port->ip:port
+        final Map<Integer, String> portMap = new HashMap<>();
+        final SSLContext sslContext = new SslContextCreator().initSSLContext(configuration.getProperty("server.https.jksPath"),
+                configuration.getProperty("server.https.keyStorePassword"), configuration.getProperty("server.https.keyManagerPassword"));
+        serverBootstrap.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<SocketChannel>() {
+
+            @Override
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                LOG.error("exceptionCaught", cause);
+                super.exceptionCaught(ctx, cause);
+            }
+
+            @Override
+            public void initChannel(SocketChannel ch) {
+                ChannelPipeline pipeline = ch.pipeline();
+                InetSocketAddress sa = ch.localAddress();
+                String ipPort = portMap.get(sa.getPort());
+                if (ipPort == null) {
+                    ch.close();
+                    return;
+                }
+                ch.attr(connectInfoAttributeKey).set(ipPort);
+                pipeline.addLast("ssl", createSslHandler(sslContext));
+                pipeline.addLast(new HttpsSocksProxyChannelHandler(proxyClientBootstrap));
+            }
+        });
+
+        if (configStr == null) {
+            return;
+        }
+        String[] configArr = configStr.split(",");
+        for (String item : configArr) {
+            String[] itemArr = item.split("->");
+            if (itemArr.length != 2) {
+                continue;
+            }
+            portMap.put(Integer.parseInt(itemArr[0]), itemArr[1]);
+            try {
+                serverBootstrap.bind("0.0.0.0", Integer.parseInt(itemArr[0])).get();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+
     }
 
     private ChannelHandler createSslHandler(SSLContext sslContext) {
