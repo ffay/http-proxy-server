@@ -1,4 +1,4 @@
-package com.io2c.httpproxyserver.handler;
+package com.io2c.httpproxyserver.handler.https;
 
 import com.io2c.httpproxyserver.HttpProxyServer;
 import io.netty.bootstrap.Bootstrap;
@@ -6,7 +6,6 @@ import io.netty.channel.*;
 import io.netty.handler.codec.http.*;
 
 import java.net.URI;
-import java.net.URLEncoder;
 import java.util.LinkedList;
 import java.util.Properties;
 import java.util.Queue;

@@ -1,28 +1,22 @@
-package com.io2c.httpproxyserver.handler.socks;
+package com.io2c.httpproxyserver.handler.https;
 
 import com.io2c.httpproxyserver.HttpProxyServer;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
-import io.netty.handler.codec.http.DefaultFullHttpResponse;
-import io.netty.handler.codec.http.FullHttpResponse;
-import io.netty.handler.codec.http.HttpResponseStatus;
-import io.netty.handler.codec.http.HttpVersion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * 处理服务端 channel.
  */
-public class HttpsSocksProxyChannelHandler extends SimpleChannelInboundHandler<ByteBuf> {
+public class HttpsTunnelProxyChannelHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
-    private static Logger logger = LoggerFactory.getLogger(HttpsSocksProxyChannelHandler.class);
+    private static Logger logger = LoggerFactory.getLogger(HttpsTunnelProxyChannelHandler.class);
 
     private Bootstrap proxyClientBootstrap;
 
-    public HttpsSocksProxyChannelHandler(Bootstrap proxyClientBootstrap) {
+    public HttpsTunnelProxyChannelHandler(Bootstrap proxyClientBootstrap) {
         this.proxyClientBootstrap = proxyClientBootstrap;
     }
 

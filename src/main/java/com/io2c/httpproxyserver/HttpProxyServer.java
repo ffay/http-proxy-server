@@ -2,10 +2,13 @@ package com.io2c.httpproxyserver;
 
 import com.io2c.httpproxyserver.container.Container;
 import com.io2c.httpproxyserver.container.ContainerHelper;
-import com.io2c.httpproxyserver.handler.HttpProxyRequestHandler;
-import com.io2c.httpproxyserver.handler.HttpsCommandHandler;
-import com.io2c.httpproxyserver.handler.socks.HttpsSocksProxyChannelHandler;
-import com.io2c.httpproxyserver.handler.socks.RealServerChannelHandler;
+import com.io2c.httpproxyserver.handler.https.HttpProxyRequestHandler;
+import com.io2c.httpproxyserver.handler.https.HttpsCommandHandler;
+import com.io2c.httpproxyserver.handler.https.HttpsTunnelProxyChannelHandler;
+import com.io2c.httpproxyserver.handler.https.HttpsTunnelProxyRealServerChannelHandler;
+import com.io2c.httpproxyserver.handler.socks.Socks5CommandRequestHandler;
+import com.io2c.httpproxyserver.handler.socks.Socks5InitialRequestHandler;
+import com.io2c.httpproxyserver.handler.socks.Socks5PasswordAuthRequestHandler;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -19,6 +22,10 @@ import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpServerCodec;
+import io.netty.handler.codec.socksx.v5.Socks5CommandRequestDecoder;
+import io.netty.handler.codec.socksx.v5.Socks5InitialRequestDecoder;
+import io.netty.handler.codec.socksx.v5.Socks5PasswordAuthRequestDecoder;
+import io.netty.handler.codec.socksx.v5.Socks5ServerEncoder;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.AttributeKey;
 import org.slf4j.Logger;
@@ -33,6 +40,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.ExecutionException;
 
 /**
  * @author fei.feng
@@ -81,7 +89,8 @@ public class HttpProxyServer implements Container {
         initProxyClient(proxyClientBootstrap, workerGroup);
         initHttpProxyServer(httpServerBootstrap, proxyClientBootstrap, bossGroup, workerGroup);
         initHttpsProxyServer(httpsServerBootstrap, proxyClientBootstrap, bossGroup, workerGroup);
-        initHttpsSocksProxyServer();
+        initHttpsTunnelProxyServer();
+        initSocks5ProxyServer();
         try {
             httpServerBootstrap.bind(configuration.getProperty("server.bind"), Integer.parseInt(configuration.getProperty(CONFIG_SERVER_PORT_KEY))).get();
             LOG.info("http proxy server started on port {}, bind {}", configuration.getProperty(CONFIG_SERVER_PORT_KEY), configuration.getProperty("server.bind"));
@@ -162,7 +171,10 @@ public class HttpProxyServer implements Container {
         });
     }
 
-    private void initHttpsSocksProxyServer() {
+    /**
+     * https隧道代理其他协议端口
+     */
+    private void initHttpsTunnelProxyServer() {
         ServerBootstrap serverBootstrap = new ServerBootstrap();
         final Bootstrap proxyClientBootstrap = new Bootstrap();
         proxyClientBootstrap.channel(NioSocketChannel.class);
@@ -170,11 +182,11 @@ public class HttpProxyServer implements Container {
 
             @Override
             public void initChannel(SocketChannel ch) {
-                ch.pipeline().addLast(new RealServerChannelHandler());
+                ch.pipeline().addLast(new HttpsTunnelProxyRealServerChannelHandler());
             }
         });
 
-        String configStr = configuration.getProperty("server.https.proxy.config");//port->ip:port,port->ip:port
+        String configStr = configuration.getProperty("https.tunnel.config");//port->ip:port,port->ip:port
         final Map<Integer, String> portMap = new HashMap<>();
         final SSLContext sslContext = new SslContextCreator().initSSLContext(configuration.getProperty("server.https.jksPath"),
                 configuration.getProperty("server.https.keyStorePassword"), configuration.getProperty("server.https.keyManagerPassword"));
@@ -197,7 +209,7 @@ public class HttpProxyServer implements Container {
                 }
                 ch.attr(connectInfoAttributeKey).set(ipPort);
                 pipeline.addLast("ssl", createSslHandler(sslContext));
-                pipeline.addLast(new HttpsSocksProxyChannelHandler(proxyClientBootstrap));
+                pipeline.addLast(new HttpsTunnelProxyChannelHandler(proxyClientBootstrap));
             }
         });
 
@@ -213,12 +225,52 @@ public class HttpProxyServer implements Container {
             portMap.put(Integer.parseInt(itemArr[0]), itemArr[1]);
             try {
                 serverBootstrap.bind("0.0.0.0", Integer.parseInt(itemArr[0])).get();
+                LOG.info("HTTPS通道绑定 {}->{}", itemArr[0], itemArr[1]);
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
         }
+    }
 
+    /**
+     * socks5协议
+     */
+    private void initSocks5ProxyServer() {
+        ServerBootstrap serverBootstrap = new ServerBootstrap();
+        serverBootstrap.group(bossGroup, workerGroup).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<SocketChannel>() {
 
+            @Override
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                LOG.error("exceptionCaught", cause);
+                super.exceptionCaught(ctx, cause);
+            }
+
+            @Override
+            public void initChannel(SocketChannel ch) {
+                //Socks5MessagByteBuf
+                ch.pipeline().addLast(Socks5ServerEncoder.DEFAULT);
+                //sock5 init
+                ch.pipeline().addLast(new Socks5InitialRequestDecoder());
+                //sock5 init
+                ch.pipeline().addLast(new Socks5InitialRequestHandler(configuration));
+                if ("true".equals(configuration.getProperty("auth.socks5"))) {
+                    ch.pipeline().addLast(new Socks5PasswordAuthRequestDecoder());
+                    ch.pipeline().addLast(new Socks5PasswordAuthRequestHandler(configuration));
+                }
+                //socks connection
+                ch.pipeline().addLast(new Socks5CommandRequestDecoder());
+                //Socks connection
+                ch.pipeline().addLast(new Socks5CommandRequestHandler(bossGroup));
+            }
+        });
+        String bind = configuration.getProperty("server.socks5.bind");
+        String port = configuration.getProperty("server.socks5.port");
+        try {
+            serverBootstrap.bind(bind, Integer.parseInt(port)).get();
+            LOG.info("绑定socks5端口 {}:{}", bind, port);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     private ChannelHandler createSslHandler(SSLContext sslContext) {

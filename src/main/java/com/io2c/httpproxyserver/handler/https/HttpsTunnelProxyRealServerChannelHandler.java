@@ -1,4 +1,4 @@
-package com.io2c.httpproxyserver.handler.socks;
+package com.io2c.httpproxyserver.handler.https;
 
 import com.io2c.httpproxyserver.HttpProxyServer;
 import io.netty.buffer.ByteBuf;
@@ -12,9 +12,9 @@ import org.slf4j.LoggerFactory;
 /**
  * 处理服务端 channel.
  */
-public class RealServerChannelHandler extends SimpleChannelInboundHandler<ByteBuf> {
+public class HttpsTunnelProxyRealServerChannelHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
-    private static Logger logger = LoggerFactory.getLogger(RealServerChannelHandler.class);
+    private static Logger logger = LoggerFactory.getLogger(HttpsTunnelProxyRealServerChannelHandler.class);
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, ByteBuf buf) throws Exception {
